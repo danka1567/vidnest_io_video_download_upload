@@ -1,0 +1,58 @@
+name: VidNest Uploader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Media URL (m3u8, HLS, mp4, YouTube, etc.)"
+        required: true
+        type: string
+      title:
+        description: "File title on VidNest (optional)"
+        required: false
+        type: string
+        default: ""
+      folder:
+        description: "VidNest folder ID (optional, leave blank for root)"
+        required: false
+        type: string
+        default: ""
+      private:
+        description: "Make file private?"
+        required: false
+        type: boolean
+        default: false
+      remote:
+        description: "Remote upload? (skip download, VidNest fetches URL — mp4/mkv direct links only)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg aria2 curl jq
+          pip install -q yt-dlp
+          echo "✅ ffmpeg $(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')"
+          echo "✅ aria2c  $(aria2c --version | head -1)"
+          echo "✅ yt-dlp  $(yt-dlp --version)"
+
+      - name: Run vidnest_upload.py
+        run: |
+          ARGS=("${{ github.event.inputs.url }}")
+
+          [ -n "${{ github.event.inputs.title }}"  ] && ARGS+=(--title  "${{ github.event.inputs.title }}")
+          [ -n "${{ github.event.inputs.folder }}" ] && ARGS+=(--folder "${{ github.event.inputs.folder }}")
+          [ "${{ github.event.inputs.private }}" = "true" ] && ARGS+=(--private)
+          [ "${{ github.event.inputs.remote }}"  = "true" ] && ARGS+=(--remote)
+
+          python3 vidnest_upload.py "${ARGS[@]}"
