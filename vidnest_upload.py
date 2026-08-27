@@ -2,36 +2,36 @@
 """
 vidnest_upload.py
 =================
-Download any media (HLS/m3u8, mp4, YouTube, etc.) at maximum speed
-and upload it to VidNest via local file upload.
+Download any media (M3U8, HLS, MP4, MKV, YouTube, etc.) at maximum speed
+using yt-dlp + aria2c 16-thread engine, then upload locally to VidNest API.
 
 Usage:
-    python vidnest_upload.py <url> [--title "My Video"] [--folder 25] [--private]
+    python vidnest_upload.py <url> [--title "My Video"] [--folder 25] [--private] [--remote]
 
-Defaults:
-    - Upload method : local file upload  (default)
-    - Remote upload : disabled by default, use --remote flag
+Default: local file upload (download first, then upload)
 """
 
-import argparse
-import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
 import time
-import urllib.parse
+import json
+import argparse
+import tempfile
+import subprocess
 from pathlib import Path
 
 import requests
 
-# ── Hardcoded API key ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  HARDCODED CREDENTIALS
+# ══════════════════════════════════════════════════════════════
 API_KEY  = "15343rbnd51sbh9vc1h7p"
 API_BASE = "https://vidnest.io/api"
 PROFILE  = "https://vidnest.io/users/donkaboy"
 
-# ── HTTP session with browser headers (prevents 403) ─────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  HTTP SESSION  (browser headers → avoids 403)
+# ══════════════════════════════════════════════════════════════
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": (
@@ -39,21 +39,33 @@ SESSION.headers.update({
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://vidnest.io/",
+    "Referer":         "https://vidnest.io/",
 })
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    """Run a command, stream output, raise on failure."""
-    print(f"\n$ {' '.join(cmd)}\n", flush=True)
-    return subprocess.run(cmd, check=True, **kwargs)
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def format_size(size_bytes) -> str:
+    if not size_bytes or size_bytes <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i, size = 0, float(size_bytes)
+    while size >= 1024.0 and i < len(units) - 1:
+        size /= 1024.0
+        i += 1
+    return f"{size:.2f} {units[i]}"
+
+
+def banner(text: str):
+    bar = "═" * 70
+    print(f"\n{bar}\n  {text}\n{bar}", flush=True)
 
 
 def api_get(endpoint: str, params: dict) -> dict:
-    """GET request to VidNest API with browser headers to avoid 403."""
     params["key"] = API_KEY
     url = f"{API_BASE}/{endpoint}"
     print(f"  → GET {url}", flush=True)
@@ -63,203 +75,192 @@ def api_get(endpoint: str, params: dict) -> dict:
     return r.json()
 
 
-def human_size(path: str) -> str:
-    size = os.path.getsize(path)
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} TB"
+# ══════════════════════════════════════════════════════════════
+#  DOWNLOAD  (yt-dlp + aria2c 16-thread engine)
+# ══════════════════════════════════════════════════════════════
 
+def high_speed_download(media_url: str, output_dir: str,
+                        custom_name: str = None,
+                        user_agent: str = None) -> Path:
+    """
+    Downloads M3U8 / HLS / MP4 / any stream using yt-dlp + aria2c
+    16-connection multi-thread engine with automatic fallback.
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    out_template = custom_name if custom_name else "%(title)s.%(ext)s"
+    out_path_template = os.path.join(output_dir, out_template)
 
-def detect_type(url: str) -> str:
-    """Return 'hls', 'direct', or 'ytdlp'."""
-    lower = url.lower().split("?")[0]
-    if ".m3u8" in lower or ".m3u" in lower:
-        return "hls"
-    direct_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv",
-                   ".flv", ".webm", ".ts", ".mpeg", ".mpg", ".m4v"}
-    if any(lower.endswith(e) for e in direct_exts):
-        return "direct"
-    return "ytdlp"
+    banner("⚡ [1/2] ULTRA-FAST MULTI-THREADED MEDIA DOWNLOAD")
+    print(f"  URL: {media_url}", flush=True)
 
-
-# ── Downloaders ───────────────────────────────────────────────────────────────
-
-def download_hls(url: str, outdir: str) -> str:
-    """ffmpeg — fastest HLS merge with multi-threading."""
-    outfile = os.path.join(outdir, "output.mp4")
-    run([
-        "ffmpeg", "-y",
-        "-protocol_whitelist", "file,crypto,data,https,http,tcp,tls",
-        "-reconnect",          "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max","10",
-        "-i", url,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        "-threads", "0",
-        outfile
-    ])
-    return outfile
-
-
-def download_direct(url: str, outdir: str) -> str:
-    """aria2c — 16 parallel connections for max speed."""
-    raw_name = os.path.basename(url.split("?")[0])
-    filename = re.sub(r"[^\w.\-]", "_", raw_name) or "output.mp4"
-    run([
-        "aria2c",
-        "--max-connection-per-server=16",
-        "--split=16",
-        "--min-split-size=1M",
-        "--max-concurrent-downloads=1",
-        "--continue=true",
-        "--file-allocation=none",
-        "--retry-wait=5",
-        "--max-tries=10",
-        "--timeout=120",
-        "--connect-timeout=30",
-        "--piece-length=1M",
-        "--disk-cache=64M",
-        "--async-dns=true",
-        "--log-level=warn",
-        f"--dir={outdir}",
-        f"--out={filename}",
-        url
-    ])
-    return os.path.join(outdir, filename)
-
-
-def download_ytdlp(url: str, outdir: str) -> str:
-    """yt-dlp — 16 concurrent fragments, best quality."""
-    outtemplate = os.path.join(outdir, "output.%(ext)s")
-    run([
+    # Primary engine: yt-dlp + aria2c (16 connections, 16 HLS fragments)
+    cmd_primary = [
         "yt-dlp",
-        "--format",            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        "--merge-output-format","mp4",
-        "--concurrent-fragments","16",
-        "--buffer-size",       "16K",
-        "--http-chunk-size",   "10M",
-        "--retries",           "10",
-        "--fragment-retries",  "10",
-        "--retry-sleep",       "5",
-        "--no-playlist",
-        "--output",            outtemplate,
-        url
-    ])
-    files = sorted(Path(outdir).glob("output.*"))
-    if not files:
-        raise FileNotFoundError("yt-dlp produced no output file")
-    return str(files[0])
+        "--downloader", "aria2c",
+        "--downloader-args",
+            "aria2c:-x 16 -s 16 -k 1M "
+            "--max-connection-per-server=16 "
+            "--min-split-size=1M "
+            "--optimize-concurrent-downloads=true "
+            "--file-allocation=none",
+        "--concurrent-fragments", "16",
+        "--hls-use-mpegts",
+        "--retries",          "10",
+        "--fragment-retries", "10",
+        "--no-check-certificates",
+        "-o", out_path_template,
+        media_url,
+    ]
+    if user_agent:
+        cmd_primary += ["--user-agent", user_agent]
 
+    # Fallback engine: native yt-dlp/ffmpeg (no aria2c needed)
+    cmd_fallback = [
+        "yt-dlp",
+        "--concurrent-fragments", "16",
+        "--retries",          "10",
+        "--fragment-retries", "10",
+        "--no-check-certificates",
+        "-o", out_path_template,
+        media_url,
+    ]
+    if user_agent:
+        cmd_fallback += ["--user-agent", user_agent]
 
-def download(url: str, outdir: str) -> str:
-    """Route URL to the best downloader, return local file path."""
-    kind = detect_type(url)
-    print(f"\n{'─'*56}")
-    print(f"  📥  URL type detected: {kind.upper()}")
-    print(f"{'─'*56}")
-
-    if kind == "hls":
-        return download_hls(url, outdir)
-
-    if kind == "direct":
-        return download_direct(url, outdir)
-
-    # ytdlp — try it; fall back to aria2c if it can't handle the URL
+    start = time.time()
     try:
-        result = subprocess.run(
-            ["yt-dlp", "--simulate", url],
-            capture_output=True, timeout=20
-        )
-        if result.returncode == 0:
-            return download_ytdlp(url, outdir)
-    except Exception:
-        pass
+        print("[Engine] Launching aria2c + yt-dlp pipeline...", flush=True)
+        subprocess.run(cmd_primary, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"[Warning] aria2c engine failed ({e}). Falling back to yt-dlp/ffmpeg...", flush=True)
+        subprocess.run(cmd_fallback, check=True)
 
-    print("  ⚠️  yt-dlp can't handle this URL — falling back to aria2c direct")
-    return download_direct(url, outdir)
+    elapsed = time.time() - start
+
+    # Find the downloaded file (most recently modified)
+    files = [f for f in Path(output_dir).iterdir()
+             if f.is_file() and not f.name.startswith(".")]
+    if not files:
+        print("❌  ERROR: No downloaded file found!", file=sys.stderr)
+        sys.exit(1)
+
+    downloaded = max(files, key=lambda p: p.stat().st_mtime)
+    size = downloaded.stat().st_size
+
+    print(f"\n✅ [DOWNLOAD COMPLETE]", flush=True)
+    print(f"  • File    : {downloaded.name}")
+    print(f"  • Size    : {format_size(size)}")
+    print(f"  • Duration: {elapsed:.2f}s")
+    return downloaded
 
 
-# ── Upload ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  UPLOAD PROGRESS WRAPPER
+# ══════════════════════════════════════════════════════════════
+
+class ProgressReader:
+    """Wraps a file to print live upload progress."""
+    def __init__(self, path: Path):
+        self.total = path.stat().st_size
+        self._f    = open(path, "rb")
+        self.sent  = 0
+        self._last = 0
+
+    def read(self, size=-1):
+        chunk = self._f.read(size)
+        if chunk:
+            self.sent += len(chunk)
+            now = time.time()
+            if now - self._last > 0.5 or self.sent == self.total:
+                pct = (self.sent / self.total * 100) if self.total else 100
+                print(
+                    f"\r  🚀 Uploading: {format_size(self.sent)} / "
+                    f"{format_size(self.total)} ({pct:.1f}%)",
+                    end="", flush=True
+                )
+                self._last = now
+        return chunk
+
+    def __len__(self):      return self.total
+    def __enter__(self):    return self
+    def __exit__(self, *_): self._f.close()
+
+
+# ══════════════════════════════════════════════════════════════
+#  VIDNEST UPLOAD
+# ══════════════════════════════════════════════════════════════
 
 def get_upload_server() -> str:
-    print("\n🔍  Getting upload server...")
+    print("\n🔍  Getting VidNest upload server...", flush=True)
     resp = api_get("upload/server", {})
     server = resp.get("result", "")
     if not server:
         raise RuntimeError(f"Could not get upload server: {resp}")
-    print(f"  ✅  Server: {server}")
+    print(f"  ✅  Server: {server}", flush=True)
     return server
 
 
-def upload_local(filepath: str, title: str, folder_id: str, public: int) -> dict:
-    """POST file directly to VidNest upload server (default method)."""
+def upload_local(file_path: Path, title: str, folder_id: str, public: int) -> dict:
+    """Multipart POST of local file to VidNest upload server (default)."""
     server = get_upload_server()
 
-    filesize = human_size(filepath)
-    filename = os.path.basename(filepath)
-    print(f"\n{'─'*56}")
-    print(f"  📤  Uploading: {filename}  ({filesize})")
-    print(f"  🌐  Server   : {server}")
-    print(f"{'─'*56}\n")
+    banner(f"📤 [2/2] UPLOADING TO VIDNEST")
+    print(f"  • File  : {file_path.name}")
+    print(f"  • Size  : {format_size(file_path.stat().st_size)}")
+    print(f"  • Server: {server}", flush=True)
 
-    data = {
+    post_data = {
         "key":         API_KEY,
         "file_public": str(public),
     }
     if title:
-        data["file_title"] = title
+        post_data["file_title"] = title
     if folder_id:
-        data["fld_id"] = folder_id
+        post_data["fld_id"] = folder_id
 
-    with open(filepath, "rb") as fh:
-        files = {"file": (filename, fh, "application/octet-stream")}
-        # Use a fresh session without Accept-Encoding to avoid issues
+    start = time.time()
+    with ProgressReader(file_path) as reader:
         resp = SESSION.post(
             server,
-            data=data,
-            files=files,
+            data=post_data,
+            files={"file": (file_path.name, reader, "application/octet-stream")},
             timeout=7200,
-            stream=False,
         )
+    elapsed = time.time() - start
 
+    print(f"\n  Upload finished in {elapsed:.2f}s", flush=True)
     print(f"  ← HTTP {resp.status_code}", flush=True)
-    print(f"  Raw response: {resp.text[:500]}", flush=True)
+    print(f"  Raw: {resp.text[:500]}", flush=True)
     resp.raise_for_status()
     return resp.json()
 
 
 def upload_remote(url: str, folder_id: str, public: int) -> dict:
-    """Submit a remote URL for VidNest to fetch (non-default)."""
-    print("\n📡  Submitting remote URL to VidNest...")
-    params = {
-        "url":         url,
-        "file_public": public,
-    }
+    """Submit a URL for VidNest to fetch itself (non-default)."""
+    print("\n📡  Submitting remote URL to VidNest...", flush=True)
+    params = {"url": url, "file_public": public}
     if folder_id:
         params["fld_id"] = folder_id
     return api_get("upload/url", params)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def banner(text: str):
-    bar = "━" * 56
-    print(f"\n{bar}\n  {text}\n{bar}")
-
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(
         description="Download any media and upload to VidNest"
     )
-    parser.add_argument("url",               help="Media URL (m3u8, mp4, YouTube, etc.)")
-    parser.add_argument("--title",  default="", help="File title on VidNest")
-    parser.add_argument("--folder", default="", help="VidNest folder ID")
-    parser.add_argument("--private",action="store_true", help="Make file private")
-    parser.add_argument("--remote", action="store_true",
-                        help="Skip download — submit URL for VidNest to fetch instead "
+    parser.add_argument("url",                   help="Media URL (m3u8, mp4, YouTube, etc.)")
+    parser.add_argument("--title",   default="", help="File title on VidNest")
+    parser.add_argument("--folder",  default="", help="VidNest folder ID")
+    parser.add_argument("--name",    default=None, help="Custom output filename (e.g. video.mp4)")
+    parser.add_argument("--user-agent", default=None, help="Custom User-Agent for download")
+    parser.add_argument("--outdir",  default="./downloads", help="Local download directory")
+    parser.add_argument("--private", action="store_true", help="Make uploaded file private")
+    parser.add_argument("--remote",  action="store_true",
+                        help="Skip download — let VidNest fetch URL directly "
                              "(direct mp4/mkv only, NOT default)")
     args = parser.parse_args()
 
@@ -270,52 +271,38 @@ def main():
     print(f"  Title  : {args.title or '(none)'}")
     print(f"  Folder : {args.folder or 'root'}")
     print(f"  Public : {'yes' if public else 'no'}")
-    print(f"  Method : {'remote URL' if args.remote else 'local file upload (default)'}")
+    print(f"  Method : {'remote URL (non-default)' if args.remote else 'local file upload (default)'}")
 
     # ── Remote upload (non-default) ──────────────────────────────────────────
     if args.remote:
         resp = upload_remote(args.url, args.folder, public)
-        banner("📨  Remote Upload Response")
+        banner("📨  Remote Upload Queued")
         print(json.dumps(resp, indent=2))
-        filecode = resp.get("result", {}).get("filecode", "")
-        if filecode:
-            print(f"\n  🔗  Future URL: https://vidnest.io/{filecode}")
-            print(f"  ⏳  VidNest will fetch the file asynchronously.")
-        print(f"  👤  Profile : {PROFILE}\n")
+        fc = (resp.get("result") or {}).get("filecode", "")
+        if fc:
+            print(f"\n  🔗  Future URL : https://vidnest.io/{fc}")
+            print(f"  ⏳  VidNest will fetch asynchronously.")
+        print(f"  👤  Profile    : {PROFILE}\n")
         return
 
-    # ── Default: download then local upload ──────────────────────────────────
+    # ── Default: download → local upload ─────────────────────────────────────
     with tempfile.TemporaryDirectory(prefix="vidnest_") as tmpdir:
-        # 1. Download
-        banner("📥  Downloading Media")
-        t0 = time.time()
-        local_file = download(args.url, tmpdir)
+        downloaded = high_speed_download(
+            media_url=args.url,
+            output_dir=tmpdir,
+            custom_name=args.name,
+            user_agent=args.user_agent,
+        )
+        resp = upload_local(downloaded, args.title, args.folder, public)
 
-        if not os.path.isfile(local_file):
-            # Search for any file that appeared in tmpdir
-            found = list(Path(tmpdir).glob("*"))
-            if not found:
-                print("❌  Download produced no file!", file=sys.stderr)
-                sys.exit(1)
-            local_file = str(found[0])
-
-        elapsed = time.time() - t0
-        size    = human_size(local_file)
-        print(f"\n  ✅  Downloaded: {local_file}  [{size}]  in {elapsed:.1f}s")
-
-        # 2. Upload
-        banner("📤  Uploading to VidNest")
-        resp = upload_local(local_file, args.title, args.folder, public)
-
-    # 3. Result
-    banner("✅  Upload Complete")
+    # ── Result ────────────────────────────────────────────────────────────────
+    banner("✅  ALL DONE")
     print(json.dumps(resp, indent=2))
-
     files = resp.get("files", [])
     if files:
-        filecode = files[0].get("filecode", "")
-        print(f"\n  🎬  File code : {filecode}")
-        print(f"  🔗  Watch URL : https://vidnest.io/{filecode}")
+        fc = files[0].get("filecode", "")
+        print(f"\n  🎬  File code : {fc}")
+        print(f"  🔗  Watch URL : https://vidnest.io/{fc}")
     print(f"  👤  Profile  : {PROFILE}\n")
 
 
