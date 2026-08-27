@@ -22,13 +22,27 @@ import sys
 import tempfile
 import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+import requests
 
 # ── Hardcoded API key ─────────────────────────────────────────────────────────
 API_KEY  = "15343rbnd51sbh9vc1h7p"
 API_BASE = "https://vidnest.io/api"
 PROFILE  = "https://vidnest.io/users/donkaboy"
+
+# ── HTTP session with browser headers (prevents 403) ─────────────────────────
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://vidnest.io/",
+})
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -39,13 +53,14 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def api_get(endpoint: str, params: dict) -> dict:
-    """Simple GET request to VidNest API, returns parsed JSON."""
+    """GET request to VidNest API with browser headers to avoid 403."""
     params["key"] = API_KEY
-    qs  = urllib.parse.urlencode(params)
-    url = f"{API_BASE}/{endpoint}?{qs}"
+    url = f"{API_BASE}/{endpoint}"
     print(f"  → GET {url}", flush=True)
-    with urllib.request.urlopen(url, timeout=30) as r:
-        return json.loads(r.read())
+    r = SESSION.get(url, params=params, timeout=30)
+    print(f"  ← HTTP {r.status_code}", flush=True)
+    r.raise_for_status()
+    return r.json()
 
 
 def human_size(path: str) -> str:
@@ -183,30 +198,37 @@ def upload_local(filepath: str, title: str, folder_id: str, public: int) -> dict
     """POST file directly to VidNest upload server (default method)."""
     server = get_upload_server()
 
+    filesize = human_size(filepath)
+    filename = os.path.basename(filepath)
     print(f"\n{'─'*56}")
-    print(f"  📤  Uploading: {filepath}  ({human_size(filepath)})")
+    print(f"  📤  Uploading: {filename}  ({filesize})")
+    print(f"  🌐  Server   : {server}")
     print(f"{'─'*56}\n")
 
-    cmd = [
-        "curl", "-X", "POST",
-        "--max-time", "7200",
-        "--retry", "3",
-        "--retry-delay", "10",
-        "--progress-bar",
-        "-F", f"key={API_KEY}",
-        "-F", f"file=@{filepath};filename={os.path.basename(filepath)}",
-        "-F", f"file_public={public}",
-    ]
+    data = {
+        "key":         API_KEY,
+        "file_public": str(public),
+    }
     if title:
-        cmd += ["-F", f"file_title={title}"]
+        data["file_title"] = title
     if folder_id:
-        cmd += ["-F", f"fld_id={folder_id}"]
-    cmd.append(server)
+        data["fld_id"] = folder_id
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    raw = result.stdout.strip() or result.stderr.strip()
-    print(f"\n  Raw response: {raw}")
-    return json.loads(raw)
+    with open(filepath, "rb") as fh:
+        files = {"file": (filename, fh, "application/octet-stream")}
+        # Use a fresh session without Accept-Encoding to avoid issues
+        resp = SESSION.post(
+            server,
+            data=data,
+            files=files,
+            timeout=7200,
+            stream=False,
+        )
+
+    print(f"  ← HTTP {resp.status_code}", flush=True)
+    print(f"  Raw response: {resp.text[:500]}", flush=True)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def upload_remote(url: str, folder_id: str, public: int) -> dict:
