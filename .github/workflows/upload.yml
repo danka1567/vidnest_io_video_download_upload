@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg aria2 curl jq
-          pip install -q yt-dlp
+          pip install -q yt-dlp requests
           echo "✅ ffmpeg $(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')"
           echo "✅ aria2c  $(aria2c --version | head -1)"
           echo "✅ yt-dlp  $(yt-dlp --version)"
